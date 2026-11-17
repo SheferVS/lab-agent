@@ -40,8 +40,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-#: Что обновлятор вообще может положить в папку агента. Всё остальное в архиве игнорируется.
-FILES = ("agent.py", "screen.py", "screen_helper.py", "updater.py", "README.md")
+#: Что обновлятор вообще может положить в папку агента. Всё остальное в архиве игнорируется, и больше ничего
+#: в папке он не трогает (на LAB-VLAD в ней же живут runner.py, lab_jobs.py, de_watch.py, свой README):
+#: свои файлы + REVISION, updater_state.json, updater.log, releases/prev.
+FILES = ("agent.py", "screen.py", "screen_helper.py", "updater.py")
 log = logging.getLogger("lab_agent.updater")
 
 
@@ -55,6 +57,12 @@ def _get(url: str, timeout: float = 30, accept: str | None = None) -> bytes:
 def remote_sha(repo: str, branch: str) -> str:
     return _get(f"https://api.github.com/repos/{repo}/commits/{branch}",
                 accept="application/vnd.github.sha").decode().strip()
+
+
+def commit_authors(repo: str, sha: str) -> set[str]:
+    """Логины автора и коммиттера коммита на GitHub (у неизвестного GitHub-у автора — пусто)."""
+    d = json.loads(_get(f"https://api.github.com/repos/{repo}/commits/{sha}"))
+    return {x["login"] for x in (d.get("author"), d.get("committer")) if x and x.get("login")}
 
 
 def fetch_release(repo: str, sha: str) -> dict[str, bytes]:
@@ -160,9 +168,18 @@ def run_once(cfg: dict, up: dict, *, check_only: bool = False) -> str:
     if sha in st.get("bad", []):
         save_state(st)
         return f"{sha[:12]} уже откатывали — ждём следующий коммит"
-    if check_only:
-        return f"есть новая версия {sha[:12]} (стоит {current[:12] or '—'})"
+    # auto = false — только сообщить (в журнал и updater_state.json), ставит человек: python updater.py
+    auto = str(up.get("auto", "true")).strip().lower() not in ("0", "false", "no", "off")
+    if check_only or not auto:
+        st["available"] = sha
+        save_state(st)
+        return f"есть новая версия {sha[:12]} (стоит {current[:12] or '—'})" + ("" if auto else "; auto = false — не ставлю")
     try:
+        allowed = {a.strip() for a in str(up.get("allowed_authors", "SheferVS")).split(",") if a.strip()}
+        who = commit_authors(up["repo"], sha)
+        if not who or not who <= allowed:
+            raise RuntimeError(f"коммит от {', '.join(sorted(who)) or 'неизвестного автора'}, "
+                               f"разрешены: {', '.join(sorted(allowed))}")
         files = fetch_release(up["repo"], sha)
         compiles(files)
     except Exception as e:

@@ -14,6 +14,7 @@ def _setup(tmp_path, monkeypatch, *, health_commit=None, bad_code=False):
     (tmp_path / "REVISION").write_text("a" * 40, encoding="utf-8")
     new = "b" * 40
     monkeypatch.setattr(U, "remote_sha", lambda repo, br: new)
+    monkeypatch.setattr(U, "commit_authors", lambda repo, sha: {"SheferVS"})
     body = b"def (:\n" if bad_code else b"VERSION = '1.3'\n"
     monkeypatch.setattr(U, "fetch_release", lambda repo, sha: {"agent.py": body, "screen.py": b"x = 1\n"})
     restarts = []
@@ -45,3 +46,27 @@ def test_broken_code_never_installed(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch, bad_code=True)
     msg = U.run_once({"port": 1, "token": "x"}, {"repo": "r"})
     assert "не взят" in msg and "1.2" in (tmp_path / "agent.py").read_text()
+
+
+def test_auto_off_only_reports(tmp_path, monkeypatch):
+    new, restarts = _setup(tmp_path, monkeypatch)
+    msg = U.run_once({"port": 1, "token": "x"}, {"repo": "r", "auto": "false"})
+    assert "не ставлю" in msg and "1.2" in (tmp_path / "agent.py").read_text() and restarts == []
+    assert U.load_state()["available"] == new
+
+
+def test_foreign_author_rejected(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(U, "commit_authors", lambda repo, sha: {"SheferVS", "stranger"})
+    msg = U.run_once({"port": 1, "token": "x"}, {"repo": "r"})
+    assert "stranger" in msg and "1.2" in (tmp_path / "agent.py").read_text()
+
+
+def test_only_own_files_touched(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    (tmp_path / "runner.py").write_text("RUNNER", encoding="utf-8")
+    (tmp_path / "README.md").write_text("станционный", encoding="utf-8")
+    monkeypatch.setattr(U, "fetch_release", lambda repo, sha: {"agent.py": b"VERSION = '1.3'\n"})
+    U.run_once({"port": 1, "token": "x"}, {"repo": "r"})
+    assert (tmp_path / "runner.py").read_text() == "RUNNER"
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == "станционный"
