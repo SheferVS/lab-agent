@@ -1,0 +1,13 @@
+# Только код. Всё машинное — на станции.
+agent.ini
+*.ini
+*.pem
+*.key
+*.crt
+screens/
+releases/
+*.log
+*.log.*
+updater_state.json
+REVISION
+__pycache__/
