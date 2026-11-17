@@ -15,7 +15,9 @@ import logging.handlers
 import sys
 from pathlib import Path
 
-import screen
+# встраиваемый Python станции не кладёт папку скрипта в sys.path (см. agent.py)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import screen  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 

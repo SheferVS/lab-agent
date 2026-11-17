@@ -54,6 +54,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+# Встраиваемый Python на станции (python312._pth) не кладёт папку скрипта в sys.path — без этой строки
+# `import screen` падает ModuleNotFoundError (LAB-VLAD 18.11 ~04:35; runner.py лечится так же).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 log = logging.getLogger("lab_agent")
 
 CONFIG: dict = {}
@@ -410,8 +414,12 @@ class Handler(BaseHTTPRequestHandler):
         # compare_digest — чтобы по времени ответа нельзя было подбирать токен
         return hmac.compare_digest(header[7:].strip(), CONFIG.get("token", ""))
 
-    def _guard(self) -> bool:
-        if not self._client_allowed():
+    def _guard(self, loopback_ok: bool = False) -> bool:
+        # /health с этой же машины — без списка IP (токен всё равно нужен): обновлятор проверяет агента
+        # после установки на 127.0.0.1, а allow_ips на станции — только адрес сервера (LAB-VLAD 18.11 ~04:35:
+        # иначе любое автообновление кончалось бы откатом).
+        local = loopback_ok and self.client_address[0] in ("127.0.0.1", "::1")
+        if not local and not self._client_allowed():
             log.warning("отказ по IP: %s", self.client_address[0])
             self._json({"error": "forbidden"}, 403)
             return False
@@ -432,12 +440,11 @@ class Handler(BaseHTTPRequestHandler):
     # ── маршруты ──
 
     def do_GET(self):
-        if not self._guard():
-            return
-
         parsed = urlparse(self.path)
         q = parse_qs(parsed.query)
         route = parsed.path.rstrip("/") or "/"
+        if not self._guard(loopback_ok=(route == "/health")):
+            return
 
         try:
             if route == "/health":

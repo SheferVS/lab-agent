@@ -59,10 +59,20 @@ def remote_sha(repo: str, branch: str) -> str:
                 accept="application/vnd.github.sha").decode().strip()
 
 
-def commit_authors(repo: str, sha: str) -> set[str]:
-    """Логины автора и коммиттера коммита на GitHub (у неизвестного GitHub-у автора — пусто)."""
+#: Коммиттер, которым GitHub подписывает слияние PR и правку через сайт — автор при этом настоящий.
+WEB_FLOW = "web-flow"
+
+
+def commit_authors(repo: str, sha: str) -> tuple[str, str]:
+    """(логин автора, логин коммиттера) на GitHub; неизвестный GitHub-у — пустая строка."""
     d = json.loads(_get(f"https://api.github.com/repos/{repo}/commits/{sha}"))
-    return {x["login"] for x in (d.get("author"), d.get("committer")) if x and x.get("login")}
+    return tuple((x or {}).get("login") or "" for x in (d.get("author"), d.get("committer")))
+
+
+def author_ok(authors: tuple[str, str], allowed: set[str]) -> bool:
+    """Автор — из разрешённых; коммиттер — из разрешённых или web-flow (слияние PR на сайте, LAB-VLAD 18.11)."""
+    author, committer = authors
+    return author in allowed and (committer in allowed or committer == WEB_FLOW)
 
 
 def fetch_release(repo: str, sha: str) -> dict[str, bytes]:
@@ -177,8 +187,8 @@ def run_once(cfg: dict, up: dict, *, check_only: bool = False) -> str:
     try:
         allowed = {a.strip() for a in str(up.get("allowed_authors", "SheferVS")).split(",") if a.strip()}
         who = commit_authors(up["repo"], sha)
-        if not who or not who <= allowed:
-            raise RuntimeError(f"коммит от {', '.join(sorted(who)) or 'неизвестного автора'}, "
+        if not author_ok(who, allowed):
+            raise RuntimeError(f"коммит: автор {who[0] or '?'}, коммиттер {who[1] or '?'}; "
                                f"разрешены: {', '.join(sorted(allowed))}")
         files = fetch_release(up["repo"], sha)
         compiles(files)
