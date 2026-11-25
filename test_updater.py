@@ -77,3 +77,14 @@ def test_web_flow_merge_allowed_only_for_own_author():
     assert U.author_ok(("SheferVS", "web-flow"), allowed)
     assert not U.author_ok(("stranger", "web-flow"), allowed)
     assert not U.author_ok(("", "SheferVS"), allowed)
+
+
+def test_new_file_arrives_on_second_pass_once(tmp_path, monkeypatch):
+    """1.3 → 1.4: прежний обновлятор ставит только agent.py/updater.py, datapool.py докладывает новый — один раз."""
+    new, restarts = _setup(tmp_path, monkeypatch)
+    (tmp_path / "REVISION").write_text(new, encoding="utf-8")          # версию уже поставил прежний обновлятор
+    monkeypatch.setattr(U, "fetch_release", lambda repo, sha: {f: b"VERSION = '1.4'\n" for f in U.FILES})
+    msg = U.run_once({"port": 1, "token": "x"}, {"repo": "r", "agent_task": "lab_agent"})
+    assert "установлена" in msg and (tmp_path / "datapool.py").exists()
+    (tmp_path / "datapool.py").unlink()                                 # файла нет и после — второй раз не ставим
+    assert U.run_once({}, {"repo": "r"}).startswith("стоит последняя")

@@ -108,6 +108,42 @@ openssl x509 -in station.crt -noout -fingerprint -sha256
 | `/file` | `path=H:\45685\1.mp4` | сам файл, потоком по 1 МБ |
 | `/screenshot` | — или `name=20261118-034412.png` | PNG: без `name` — свежий кадр помощника (`X-Screen-Age` — сколько секунд кадру; кадра нет или старше `screen_max_age_sec` — 409 с причиной), с `name` — кадр из ленты |
 | `/screenshots` | `since=<unix-время>` | `{enabled, interval_sec, latest: {ok, age_sec | error}, last_error, items: [{name, at, size}]}` — лента, свежие первыми |
+| `/disks` | `refresh=1` — пересобрать | индекс дисков (1.4): `{scanned_at, scanning, volumes, folders: [{path, name, volume, depth, order_nums, is_data, info: {model, fw, serial, port, destin, text}, images: [{kind, files, bytes, where}], subdirs}], errors}` |
+| `/delivery/copies[/<id>]` | — | выгрузки на шару: `{state: queued…copying…verifying…done|failed|interrupted, files_total, bytes_total, files_done, bytes_done, skipped, verify: {src_files, src_bytes, dst_files, dst_bytes, ok, mismatch}}` |
+
+Запись: `POST /jobs…` (задания, см. ниже) и `POST /delivery/copy {src}` — копия папки из индекса в
+`delivery_root\<имя папки>` (1.4).
+
+## Индекс дисков и выдача данных (с версии 1.4, 19.11.2026)
+
+Задача 2480, ТЗ `TASK_data_delivery_2026-07-31.md` §0. Агент сам, в фоне, обходит все готовые локальные тома
+(кроме системного) на глубину 1–2 и находит папки заказов: номер в имени (`46154_data`), паспорт задачи PC-3000
+(`task.info` — модель, прошивка, серийник; cp1251), образы (куски `img<LBA>.bin` + `Head.map`, `*.deff`,
+файл-образ). Чей это заказ, решает бэк — сличает с RO по номеру, серийнику, модели, названию клиента.
+
+Выгрузка — копия папки из индекса на шару `delivery_root` под тем же именем, со сверкой числа файлов и байт.
+Источник не трогается, ничего не удаляется; уже лежащий файл того же размера и времени не копируется заново.
+Агент работает задачей планировщика S4U («без входа»): диск `Z:`, подключённый у пользователя, ему не виден,
+и сетевых учётных данных у такого входа нет — в `delivery_root` пишется UNC-путь, учётка шары —
+`delivery_user` / `delivery_password` (агент делает `net use` сам). Может ли агент писать в шару, видно сразу:
+`GET /station` → `delivery: {ok, error, root, at}` (проверка пишет один свой файл `_lab_agent_write_check.txt`
+в корень шары, раз в 5 минут, в фоне). Индекс только листает каталоги и читает `task.info` с
+`FILE_SHARE_READ|WRITE|DELETE` — идущему снятию в PC-3000 DE не мешает; образы не открывает никогда.
+
+```ini
+index = on                       ; off — не строить индекс (GET /disks → 404)
+index_skip = C                   ; тома, которые не обходить (по умолчанию — системный)
+index_extra =                    ; доп. папки задач через «;». Bin каждой установки PC-3000 (Express, Portable)
+                                 ; находится сам: реестр Uninstall (64 и 32 бит) → InstallLocation\Bin, плюс
+                                 ; <Program Files | Program Files (x86)>\ACE Lab\*\Bin. Там задачи «напрямую с
+                                 ; пациентом», без образа; у каждой задачи в индексе — product (какой PC-3000)
+index_interval_min = 15          ; как часто пересобирать
+delivery_root = \\kompstation\web   ; пусто — выгрузка выключена
+delivery_user =                  ; учётка шары: агент — задача S4U («без входа»), сетевых учёток у неё нет
+delivery_password =              ; только локально, в agent.ini; агент делает net use сам
+delivery_fresh_min = 10          ; в папке менялись файлы позже — не копировать: выгрузку ещё пишут
+state_dir =                      ; где лежат datapool_index.json и delivery_copies.json (пусто — рядом с agent.py)
+```
 
 ## Снимки экрана (с версии 1.3, 18.11.2026)
 
@@ -143,7 +179,8 @@ screens_dir =               ; пусто — папка screens рядом с ag
 Код агента лежит в открытом репозитории **github.com/SheferVS/lab-agent** (только код; `agent.ini`,
 сертификат, ключ, снимки, журналы — только на станции, в репозиторий не попадают). `updater.py` раз в 5 минут
 спрашивает GitHub, какой коммит в ветке, и если он новый — скачивает архив этого коммита, берёт только
-`agent.py, screen.py, screen_helper.py, updater.py` (больше ничего в папке не трогает — рядом могут жить
+`agent.py, screen.py, screen_helper.py, updater.py, datapool.py` (новый файл обновлятор прежней версии не
+знает — его докладывает второй проход уже нового обновлятора; больше ничего в папке не трогает — рядом могут жить
 `runner.py` и прочее станционное), проверяет автора коммита и что код компилируется, сохраняет
 текущие файлы в `releases/prev`, ставит новые, пишет `REVISION`, перезапускает задачи агента и помощника и
 спрашивает `/health`. Агент не поднялся или поднялся не тем коммитом — откат на прежние файлы, коммит

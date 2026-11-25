@@ -43,7 +43,7 @@ HERE = Path(__file__).resolve().parent
 #: Что обновлятор вообще может положить в папку агента. Всё остальное в архиве игнорируется, и больше ничего
 #: в папке он не трогает (на LAB-VLAD в ней же живут runner.py, lab_jobs.py, de_watch.py, свой README):
 #: свои файлы + REVISION, updater_state.json, updater.log, releases/prev.
-FILES = ("agent.py", "screen.py", "screen_helper.py", "updater.py")
+FILES = ("agent.py", "screen.py", "screen_helper.py", "updater.py", "datapool.py")
 log = logging.getLogger("lab_agent.updater")
 
 
@@ -171,6 +171,13 @@ def run_once(cfg: dict, up: dict, *, check_only: bool = False) -> str:
         save_state(st)
         return st["last_error"]
     current = (HERE / "REVISION").read_text(encoding="utf-8").strip() if (HERE / "REVISION").exists() else ""
+    # Прежний обновлятор ставит только свой список файлов: новый файл (datapool.py в 1.4) приезжает вторым
+    # проходом уже нового обновлятора — та же версия, но файла нет → ставим её заново. Один раз на версию
+    # (`healed`): если файла нет и в самом релизе, переустановка каждые 5 минут перезапускала бы агента.
+    missing = [f for f in FILES if not (HERE / f).exists()]
+    if sha == current and missing and st.get("healed") != sha:
+        current = ""
+        log.info("стоит %s, но нет %s — ставлю версию заново", sha[:12], ", ".join(missing))
     if sha == current:
         st["last_error"] = None
         save_state(st)
@@ -218,7 +225,7 @@ def run_once(cfg: dict, up: dict, *, check_only: bool = False) -> str:
         st.setdefault("history", []).append({"at": st["last_check"], "sha": sha, "result": "rolled_back", "error": str(e)})
         save_state(st)
         return st["last_error"]
-    st.update(current=sha, last_error=None, installed_at=st["last_check"], version=h.get("version"))
+    st.update(current=sha, last_error=None, installed_at=st["last_check"], version=h.get("version"), healed=sha)
     st.setdefault("history", []).append({"at": st["last_check"], "sha": sha, "result": "installed",
                                          "version": h.get("version")})
     save_state(st)

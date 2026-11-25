@@ -35,6 +35,11 @@
 1.2 (ТЗ §10б п.2 — копия задания у нас): GET /jobs — список заданий, GET /jobs/<id>/files — опись
 папки, `offset` у /file — докачка с места, GET /station — пульс исполнителя, тома, хвосты журналов.
 Всё только чтение.
+
+1.4 (задача 2480, выдача данных — datapool.py): GET /disks — индекс всех локальных дисков (папки заказов,
+паспорт task.info, образы; строится в фоне, `?refresh=1` — пересобрать); POST /delivery/copy {src} — копия
+папки из индекса на шару `delivery_root` со сверкой; GET /delivery/copies[/<id>] — ход и итог. Запись — только
+в `delivery_root\\<имя папки>`, источник не трогается, ничего не удаляется.
 """
 
 import argparse
@@ -76,7 +81,41 @@ LOG_TAIL_BYTES = 256 * 1024
 MAX_LOG_LINES = 500
 _APPEND_LOCK = threading.Lock()
 
-VERSION = "1.3"
+VERSION = "1.4"
+
+POOL = None        # datapool.Index — индекс дисков (None — выключен: index = off)
+COPIER = None      # datapool.Copier — выгрузка на шару
+
+
+def state_dir() -> Path:
+    return Path(CONFIG.get("state_dir") or Path(__file__).resolve().parent)
+
+
+def setup_datapool(start_thread: bool = True) -> None:
+    """Индекс дисков и выгрузка (2480). Системный том не индексируем: на нём Windows, а не заказы."""
+    global POOL, COPIER
+    try:
+        import datapool
+    except ImportError as e:
+        # Обновлятор 1.3 про datapool.py не знает: первым проходом приезжает только этот файл. Без защиты агент не
+        # поднялся бы, обновлятор откатил бы версию и занёс коммит в плохие (LAB-VLAD, 25.11 14:05, #4129).
+        log.warning("datapool.py не установлен (%s) — без индекса дисков и выгрузки до следующего прохода обновлятора", e)
+        return
+    if str(CONFIG.get("index", "on")).strip().lower() not in ("0", "off", "false", "no"):
+        sysdrive = (os.environ.get("SystemDrive") or "C:")[:1].upper()
+        skip = {x.strip().upper()[:1] for x in str(CONFIG.get("index_skip", sysdrive)).split(",") if x.strip()}
+        # задачи PC-3000 на системном томе (Program Files\ACE Lab\PC-3000\Bin) — сами + index_extra из agent.ini
+        extra = datapool.pc3000_task_roots() + [x.strip() for x in str(CONFIG.get("index_extra", "")).split(";")
+                                                if x.strip()]
+        POOL = datapool.Index(state_dir() / "datapool_index.json", list_volumes, skip=skip,
+                              interval_sec=float(CONFIG.get("index_interval_min", 15)) * 60, extra_roots=extra)
+        if start_thread:
+            threading.Thread(target=POOL.loop, daemon=True, name="datapool-index").start()
+    COPIER = datapool.Copier(state_dir() / "delivery_copies.json", root=CONFIG.get("delivery_root", "").strip(),
+                             user=CONFIG.get("delivery_user", "").strip(),
+                             password=CONFIG.get("delivery_password", ""),
+                             allowed_fn=(POOL.paths if POOL else (lambda: set())),
+                             fresh_sec=float(CONFIG.get("delivery_fresh_min", 10)) * 60)
 
 
 def git_commit() -> str:
@@ -451,7 +490,29 @@ class Handler(BaseHTTPRequestHandler):
                 roots = [{"path": str(r), "exists": r.exists()} for r in _roots()]
                 jr = jobs_root()
                 self._json({"ok": True, "name": CONFIG.get("name", ""), "version": VERSION, "roots": roots,
-                            "jobs": bool(jr) and jr.exists(), "commit": git_commit()})
+                            "jobs": bool(jr) and jr.exists(), "commit": git_commit(),
+                            "disks_index": POOL is not None,
+                            "delivery": bool(COPIER and COPIER.root)})
+
+            elif route == "/disks":
+                if POOL is None:
+                    self._json({"error": "disks index disabled (index = off)"}, 404)
+                    return
+                if (q.get("refresh") or [""])[0] in ("1", "true"):
+                    POOL.request()
+                self._json(POOL.snapshot())
+
+            elif route == "/delivery/copies":
+                self._json({"enabled": bool(COPIER and COPIER.root),
+                            "root": COPIER.root if COPIER else "", "items": COPIER.list() if COPIER else [],
+                            "probe": COPIER.probe_status() if COPIER and COPIER.root else None})
+
+            elif route.startswith("/delivery/copies/"):
+                item = COPIER.get(route.rsplit("/", 1)[1]) if COPIER else None
+                if not item:
+                    self._json({"error": "no such copy"}, 404)
+                    return
+                self._json(item)
 
             elif route == "/station":
                 try:
@@ -462,7 +523,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"name": CONFIG.get("name", ""), "agent_version": VERSION,
                             "now": _mtime_iso(datetime.now(timezone.utc).timestamp()),
                             "runner": runner_pulse(), "volumes": list_volumes(),
-                            "logs": log_tails(lines)})
+                            "logs": log_tails(lines),
+                            # может ли агент писать в шару выдачи из своей сессии (S4U — без сетевых учёток)
+                            "delivery": COPIER.probe_status() if COPIER and COPIER.root else None})
 
             elif route == "/jobs":
                 if jobs_root() is None:
@@ -521,6 +584,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route == "/jobs":
                 self._post_create_job()
+            elif route == "/delivery/copy":
+                body = self._read_json()
+                if body is None:
+                    return
+                if COPIER is None:
+                    self._json({"error": "delivery disabled"}, 404)
+                    return
+                item, err = COPIER.start(str(body.get("src") or ""))
+                if err:
+                    self._json({"error": err}, 409)
+                    return
+                log.info("выгрузка: %s → %s (запрос бэка)", item["src"], item["dst"])
+                self._json({"ok": True, "copy": item})
             elif route.startswith("/jobs/"):
                 self._post_job_action(route)
             else:
@@ -798,6 +874,11 @@ def main():
     missing = [str(r) for r in _roots() if not r.exists()]
     if missing:
         log.warning("корни не найдены (диск не подключён?): %s", ", ".join(missing))
+
+    try:
+        setup_datapool()
+    except Exception:                    # индекс и выгрузка — не повод не отдавать остальное
+        log.exception("индекс дисков / выгрузка не запущены")
 
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
