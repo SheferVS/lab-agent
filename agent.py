@@ -40,6 +40,14 @@
 паспорт task.info, образы; строится в фоне, `?refresh=1` — пересобрать); POST /delivery/copy {src} — копия
 папки из индекса на шару `delivery_root` со сверкой; GET /delivery/copies[/<id>] — ход и итог. Запись — только
 в `delivery_root\\<имя папки>`, источник не трогается, ничего не удаляется.
+
+1.5 (задача 4131, ТЗ TZ_lab_estimate_and_disks_2026-11-25.md §3): размер каждой папки индекса (`bytes_total`,
+`files_total`, `sized_at` в /disks — считает отдельный поток, по одной папке, с паузами) и корзина:
+POST /folders/trash {path, order_ref, from} — перенос в `<том>:\\_КОРЗИНА\\<дата>_<имя>`, POST /folders/restore
+{id} — вернуть, POST /folders/purge {id} — удалить насовсем, POST /folders/delete {path, …} — «удалить сразу»
+без корзины, GET /folders/trash — что лежит в корзине. Это единственные ручки агента, которые удаляют данные;
+запреты (только папка из индекса, не корень тома, не системный том, не ссылка, не папка в работе, не занятый
+файл) — в datapool.Trash.check, и обойти их снаружи нельзя.
 """
 
 import argparse
@@ -81,19 +89,128 @@ LOG_TAIL_BYTES = 256 * 1024
 MAX_LOG_LINES = 500
 _APPEND_LOCK = threading.Lock()
 
-VERSION = "1.4"
+VERSION = "1.6"
+
+# ── Запуск команд с нашего сервера (1.6, #4279) ──
+# Виктор 26.11 ~16:28 на вопрос, что разрешить агенту станции LAB-2: «Любая команда». На Windows 8.1 Claude не
+# встаёт, поэтому думает Claude на сервере, а станция исполняет. Включается ТОЛЬКО строкой `exec = on` в agent.ini
+# станции: обновлятор везёт этот код на все станции, а без строки ручки нет (404) — LAB-VLAD её не получает молча.
+# Защита та же, что у всех ручек: allow_ips + токен + пиннинг сертификата. Каждая команда — строкой в журнал.
+EXEC_MAX_OUT = 2_000_000          # байт stdout/stderr в ответе; дальше — обрезано, truncated = true
+EXEC_MAX_TIMEOUT = 3600           # сек; по истечении дерево процессов убивается (taskkill /T /F)
+EXEC_DEFAULT_TIMEOUT = 120
+
+
+def exec_enabled() -> bool:
+    return str(CONFIG.get("exec", "")).strip().lower() in ("on", "true", "1", "yes")
+
+
+def _decode_out(b: bytes) -> str:
+    """Вывод консоли: PowerShell мы просим писать UTF-8, cmd пишет в OEM-кодировке (cp866 у русской Windows)."""
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return b.decode("cp866", "replace")
+
+
+def run_command(cmd: str, *, shell: str = "cmd", cwd: str | None = None,
+                timeout: int = EXEC_DEFAULT_TIMEOUT) -> dict:
+    """Выполнить команду и вернуть {exit_code, stdout, stderr, ms, timed_out, truncated}. PowerShell — через
+    -EncodedCommand: так текст команды доходит как есть, без споров о кавычках командной строки."""
+    import base64
+    import subprocess
+    import time
+    if shell == "powershell":
+        script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference='SilentlyContinue'; " + cmd
+        args = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode("ascii")]
+        use_shell = False
+    else:
+        args, use_shell = cmd, True
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    t0 = time.monotonic()
+    proc = subprocess.Popen(args, shell=use_shell, cwd=cwd or None, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
+    timed_out = False
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, creationflags=flags)
+        out, err = proc.communicate()
+    ms = int((time.monotonic() - t0) * 1000)
+    truncated = len(out) > EXEC_MAX_OUT or len(err) > EXEC_MAX_OUT
+    res = {"exit_code": proc.returncode, "stdout": _decode_out(out[:EXEC_MAX_OUT]),
+           "stderr": _decode_out(err[:EXEC_MAX_OUT]), "ms": ms, "timed_out": timed_out, "truncated": truncated}
+    log.info("exec [%s] %s → код %s за %d мс%s", shell, cmd[:500].replace("\n", " ⏎ "), proc.returncode, ms,
+             " (по таймауту)" if timed_out else "")
+    return res
 
 POOL = None        # datapool.Index — индекс дисков (None — выключен: index = off)
 COPIER = None      # datapool.Copier — выгрузка на шару
+SIZER = None       # datapool.Sizer — размеры папок индекса (1.5)
+TRASH = None       # datapool.Trash — корзина станции (1.5)
+
+# Задание станции «в работе»: исполнитель держит папку и пишет в неё — такую папку не переносим и не удаляем.
+ACTIVE_JOB_STATES = {"queued", "running", "waiting_answer", "waiting_selection", "cancel_requested"}
+PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 def state_dir() -> Path:
     return Path(CONFIG.get("state_dir") or Path(__file__).resolve().parent)
 
 
+def _paths_in(obj, out: set, depth: int = 0) -> None:
+    """Все абсолютные пути, какие есть в задании: имя поля не угадываем — у разных заданий они разные."""
+    if depth > 6:
+        return
+    if isinstance(obj, str):
+        s = obj.strip()
+        if PATH_RE.match(s):
+            out.add(os.path.normpath(s))
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _paths_in(v, out, depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _paths_in(v, out, depth + 1)
+
+
+def busy_paths() -> set:
+    """Папки, по которым идёт работа станции: источник идущей выгрузки и папки заданий в работе (пути из
+    job.json + папки индекса с номером заказа этого задания). Корзина спрашивает это перед каждым переносом."""
+    out: set = set()
+    if COPIER:
+        for it in COPIER.list():
+            if it.get("state") in ("queued", "connecting", "counting", "copying", "verifying") and it.get("src"):
+                out.add(os.path.normpath(it["src"]))
+    root = jobs_root()
+    if root is None or not root.is_dir():
+        return {p for p in out if p}
+    import datapool
+    live_orders: set = set()
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or not JOB_ID_RE.match(d.name) or not (d / "job.json").is_file():
+            continue
+        if job_status(d, 0)["state"] not in ACTIVE_JOB_STATES:
+            continue
+        try:
+            job = json.loads((d / "job.json").read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        _paths_in(job, out)
+        ref = str((job or {}).get("order_ref") or "")
+        live_orders |= set(datapool.order_nums(ref) or re.findall(r"\d{5,6}", ref))
+    if live_orders and POOL is not None:
+        for f in POOL.folders():
+            if live_orders & set(f.get("order_nums") or []):
+                out.add(os.path.normpath(f.get("path") or ""))
+    return {p for p in out if p}
+
+
 def setup_datapool(start_thread: bool = True) -> None:
-    """Индекс дисков и выгрузка (2480). Системный том не индексируем: на нём Windows, а не заказы."""
-    global POOL, COPIER
+    """Индекс дисков, размеры, выгрузка и корзина (2480, 4131). Системный том не индексируем: на нём Windows."""
+    global POOL, COPIER, SIZER, TRASH
     try:
         import datapool
     except ImportError as e:
@@ -109,13 +226,28 @@ def setup_datapool(start_thread: bool = True) -> None:
                                                 if x.strip()]
         POOL = datapool.Index(state_dir() / "datapool_index.json", list_volumes, skip=skip,
                               interval_sec=float(CONFIG.get("index_interval_min", 15)) * 60, extra_roots=extra)
+        if str(CONFIG.get("sizes", "on")).strip().lower() not in ("0", "off", "false", "no"):
+            SIZER = datapool.Sizer(state_dir() / "datapool_sizes.json", POOL.folders,
+                                   between_sec=float(CONFIG.get("size_pause_sec", datapool.SIZE_BETWEEN_SEC)),
+                                   max_sec=float(CONFIG.get("size_max_min", 30)) * 60)
+            POOL.sizes_fn = SIZER.all
         if start_thread:
             threading.Thread(target=POOL.loop, daemon=True, name="datapool-index").start()
+            if SIZER is not None:
+                threading.Thread(target=SIZER.loop, daemon=True, name="datapool-sizes").start()
     COPIER = datapool.Copier(state_dir() / "delivery_copies.json", root=CONFIG.get("delivery_root", "").strip(),
                              user=CONFIG.get("delivery_user", "").strip(),
                              password=CONFIG.get("delivery_password", ""),
                              allowed_fn=(POOL.paths if POOL else (lambda: set())),
                              fresh_sec=float(CONFIG.get("delivery_fresh_min", 10)) * 60)
+    # Корзина: удаляет только то, что индекс нашёл сам, поэтому `index = off` — это и «удалять нечего».
+    TRASH = datapool.Trash(state_dir() / "folder_trash.json",
+                           allowed_fn=(POOL.paths if POOL else (lambda: set())),
+                           index_fn=(POOL.folders if POOL else (lambda: [])),
+                           busy_fn=busy_paths,
+                           sizes_fn=(SIZER.get if SIZER is not None else (lambda _p: None)),
+                           forget_fn=(SIZER.forget if SIZER is not None else None),
+                           fresh_sec=float(CONFIG.get("delivery_fresh_min", 10)) * 60)
 
 
 def git_commit() -> str:
@@ -491,8 +623,9 @@ class Handler(BaseHTTPRequestHandler):
                 jr = jobs_root()
                 self._json({"ok": True, "name": CONFIG.get("name", ""), "version": VERSION, "roots": roots,
                             "jobs": bool(jr) and jr.exists(), "commit": git_commit(),
-                            "disks_index": POOL is not None,
-                            "delivery": bool(COPIER and COPIER.root)})
+                            "disks_index": POOL is not None, "folder_sizes": SIZER is not None,
+                            "folder_trash": TRASH is not None,
+                            "delivery": bool(COPIER and COPIER.root), "exec": exec_enabled()})
 
             elif route == "/disks":
                 if POOL is None:
@@ -500,7 +633,20 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if (q.get("refresh") or [""])[0] in ("1", "true"):
                     POOL.request()
-                self._json(POOL.snapshot())
+                out = POOL.snapshot()
+                # размеры считает отдельный поток: видно, какую папку он считает сейчас и сколько уже знает
+                out["sizes"] = ({"enabled": False} if SIZER is None else
+                                {"enabled": True, "busy": SIZER.busy, "known": len(SIZER.all()),
+                                 "todo": len(SIZER.stale_folders())})
+                self._json(out)
+
+            elif route == "/folders/trash":
+                if TRASH is None:
+                    self._json({"error": "folder trash disabled (no disks index)"}, 404)
+                    return
+                import datapool
+                self._json({"enabled": True, "trash_name": datapool.TRASH_NAME,
+                            "items": TRASH.list((q.get("state") or [""])[0])})
 
             elif route == "/delivery/copies":
                 self._json({"enabled": bool(COPIER and COPIER.root),
@@ -597,6 +743,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 log.info("выгрузка: %s → %s (запрос бэка)", item["src"], item["dst"])
                 self._json({"ok": True, "copy": item})
+            elif route in ("/folders/trash", "/folders/delete", "/folders/restore", "/folders/purge"):
+                self._post_folder_action(route)
+            elif route == "/exec":
+                self._post_exec()
             elif route.startswith("/jobs/"):
                 self._post_job_action(route)
             else:
@@ -604,6 +754,65 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             log.exception("ошибка обработки POST %s", route)
             self._json({"error": str(e)[:200]}, 500)
+
+    def _post_exec(self):
+        """`POST /exec {cmd, shell?: cmd|powershell, cwd?, timeout?}` — только при `exec = on` (иначе 404, как
+        будто ручки нет). Ответ — вывод команды; ошибка запуска — 500 с текстом."""
+        if not exec_enabled():
+            self._json({"error": "not found"}, 404)
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        cmd = str(body.get("cmd") or "").strip()
+        shell = str(body.get("shell") or "cmd").strip().lower()
+        cwd = str(body.get("cwd") or "").strip() or None
+        if not cmd:
+            self._json({"error": "cmd required"}, 400)
+            return
+        if shell not in ("cmd", "powershell"):
+            self._json({"error": "shell: cmd или powershell"}, 400)
+            return
+        if cwd and not Path(cwd).is_dir():
+            self._json({"error": f"нет папки {cwd}"}, 400)
+            return
+        try:
+            timeout = max(1, min(EXEC_MAX_TIMEOUT, int(body.get("timeout") or EXEC_DEFAULT_TIMEOUT)))
+        except (TypeError, ValueError):
+            self._json({"error": "timeout — число секунд"}, 400)
+            return
+        self._json({"ok": True, **run_command(cmd, shell=shell, cwd=cwd, timeout=timeout)})
+
+    # ── корзина и удаление (1.5, ТЗ §3.2–3.4) ──
+
+    def _post_folder_action(self, route: str):
+        """`/folders/trash|delete|restore|purge`. Решение «можно ли» принимает бэк (права, заказ закрыт,
+        подтверждение номером), а запреты по самим данным — агент: он один видит, что лежит на дисках."""
+        if TRASH is None:
+            self._json({"error": "folder trash disabled (no disks index)"}, 404)
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        who = str(body.get("from") or "")[:200]
+        if route in ("/folders/trash", "/folders/delete"):
+            path = str(body.get("path") or "")
+            order_ref = str(body.get("order_ref") or "")
+            if route == "/folders/trash":
+                rec, err = TRASH.move(path, order_ref=order_ref, by=who)
+            else:
+                rec, err = TRASH.delete_now(path, order_ref=order_ref, by=who)
+        else:
+            tid = str(body.get("id") or "")
+            if not JOB_ID_RE.match(tid):
+                self._json({"error": "id required ([A-Za-z0-9_-]{1,64})"}, 400)
+                return
+            rec, err = TRASH.restore(tid) if route == "/folders/restore" else TRASH.purge(tid, by=who)
+        if err:
+            # 409, а не 500: это не сбой агента, а «так делать нельзя» — текст показываем человеку как есть
+            self._json({"error": err}, 409)
+            return
+        self._json({"ok": True, "item": rec})
 
     # ── задания (§5, §5а) ──
 

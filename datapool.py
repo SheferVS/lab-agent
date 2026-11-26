@@ -427,12 +427,13 @@ class Index:
     """Индекс в памяти + файл рядом с агентом (переживает перезапуск). Скан — в фоне, по таймеру и по просьбе."""
 
     def __init__(self, state_path: Path, volumes_fn, *, skip: set[str], interval_sec: float,
-                 extra_roots: list = ()):
+                 extra_roots: list = (), sizes_fn=None):
         self.state_path = state_path
         self.volumes_fn = volumes_fn
         self.skip = skip
         self.extra_roots = list(extra_roots)
         self.interval = interval_sec
+        self.sizes_fn = sizes_fn        # Sizer.all — размеры папок считает отдельный поток (1.5)
         self.lock = threading.Lock()
         self.scanning = False
         self.last_error: str | None = None
@@ -442,10 +443,18 @@ class Index:
         except (OSError, ValueError):
             self.data = {"scanned_at": None, "folders": [], "volumes": [], "errors": []}
 
+    def folders(self) -> list[dict]:
+        """Папки индекса без размеров — для того, кто их считает (Sizer)."""
+        with self.lock:
+            return [dict(f) for f in self.data.get("folders", [])]
+
     def snapshot(self) -> dict:
         with self.lock:
-            return {**self.data, "scanning": self.scanning, "last_error": self.last_error,
-                    "interval_sec": self.interval}
+            out = {**self.data, "scanning": self.scanning, "last_error": self.last_error,
+                   "interval_sec": self.interval}
+        if self.sizes_fn:
+            out["folders"] = merge_sizes(out.get("folders") or [], self.sizes_fn())
+        return out
 
     def paths(self) -> set[str]:
         with self.lock:
@@ -481,6 +490,184 @@ class Index:
             self.wake.clear()
             self.run_once()
             self.wake.wait(self.interval)
+
+
+# ── размер папки (1.5, ТЗ §3.2) ────────────────────────────────────────────────────────────────────────────
+# Индекс размеры не считает намеренно: это обход тысяч файлов на каждом проходе. Считает отдельный поток, по
+# одной папке, с паузами — на томах станции идёт снятие в PC-3000, и наш обход не должен с ним спорить.
+# Не посчитано — `null`, а не ноль: «ноль байт» и «ещё не считали» для человека с кнопкой «Удалить» — разное.
+
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+SIZE_PAUSE_EACH = 2000          # файлов между паузами внутри одной папки
+SIZE_PAUSE_SEC = 0.02
+SIZE_BETWEEN_SEC = 2.0          # пауза между папками
+SIZE_IDLE_SEC = 60.0            # считать нечего — спать
+SIZE_STALE_SEC = 24 * 3600      # пересчёт, даже если время папки не менялось (меняли внутри подпапок)
+SIZE_MAX_SEC = 1800.0           # предел на одну папку: терабайтный образ не должен держать поток сутки
+
+
+def is_reparse(path: str) -> bool:
+    """Точка повторной обработки: символическая ссылка, junction, смонтированный том. Такие папки не
+    обходим и не удаляем — за ними лежит чужое дерево, а «удалить ссылку» выглядит как «удалить папку»."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT:
+        return True
+    return os.path.islink(path)
+
+
+def dir_size(path: str, *, pause_each: int = SIZE_PAUSE_EACH, pause_sec: float = SIZE_PAUSE_SEC,
+             max_sec: float | None = SIZE_MAX_SEC) -> dict:
+    """Сколько файлов и байт в папке целиком. Только листинг каталогов, файлы не открываются.
+    Упёрлись в предел времени — отдаём, сколько посчитали, с `partial: true` (не ноль и не None).
+    `max_sec` None или 0 — считать до конца, сколько бы ни заняло."""
+    started = time.monotonic()
+    files = total = seen = 0
+    error = None
+    stack = [path]
+    while stack:
+        for e in _scandir(stack.pop()):
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if not is_reparse(e.path):
+                        stack.append(e.path)
+                    continue
+                total += e.stat(follow_symlinks=False).st_size
+            except OSError as ex:
+                error = str(ex)[:200]
+                continue
+            files += 1
+            seen += 1
+            if pause_each and seen % pause_each == 0:
+                time.sleep(pause_sec)
+                if max_sec is not None and max_sec > 0 and time.monotonic() - started > max_sec:
+                    return {"files_total": files, "bytes_total": total, "partial": True, "error": error}
+    return {"files_total": files, "bytes_total": total, "partial": False, "error": error}
+
+
+def merge_sizes(folders: list[dict], sizes: dict) -> list[dict]:
+    """Папки индекса + размеры из `Sizer`. Нет записи — поля `null`: «ещё не считали»."""
+    out = []
+    for f in folders:
+        rec = sizes.get(os.path.normcase(f.get("path") or "")) or {}
+        out.append({**f, "bytes_total": rec.get("bytes_total"), "files_total": rec.get("files_total"),
+                    "sized_at": rec.get("sized_at"), "size_partial": rec.get("partial") or False,
+                    "size_error": rec.get("error")})
+    return out
+
+
+class Sizer:
+    """Размеры папок индекса: своё состояние в файле, пересчёт по смене времени папки или раз в сутки.
+    За проход считает ОДНУ папку — так между папками всегда есть пауза, даже если их тысяча."""
+
+    def __init__(self, state_path: Path | str, folders_fn, *, between_sec: float = SIZE_BETWEEN_SEC,
+                 idle_sec: float = SIZE_IDLE_SEC, stale_sec: float = SIZE_STALE_SEC,
+                 max_sec: float = SIZE_MAX_SEC):
+        self.state_path = Path(state_path)
+        self.folders_fn = folders_fn
+        self.between = between_sec
+        self.idle = idle_sec
+        self.stale = stale_sec
+        self.max_sec = max_sec
+        self.lock = threading.Lock()
+        self.busy: str | None = None       # какую папку считаем сейчас — видно в /disks
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.sizes = {k: v for k, v in (data.get("sizes") or {}).items() if isinstance(v, dict)}
+        except (OSError, ValueError):
+            self.sizes = {}
+
+    def all(self) -> dict:
+        with self.lock:
+            return {k: dict(v) for k, v in self.sizes.items()}
+
+    def get(self, path: str) -> dict | None:
+        with self.lock:
+            rec = self.sizes.get(os.path.normcase(path or ""))
+            return dict(rec) if rec else None
+
+    def forget(self, path: str) -> None:
+        """Папку перенесли или удалили — её размер больше не про неё."""
+        with self.lock:
+            self.sizes.pop(os.path.normcase(path or ""), None)
+            self._save()
+
+    def _save(self) -> None:
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"sizes": self.sizes}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, self.state_path)
+
+    def stale_folders(self) -> list[dict]:
+        """Какие папки индекса считать: нет записи, время папки изменилось или запись старше `stale_sec`."""
+        now = time.time()
+        have = self.all()
+        out = []
+        for f in self.folders_fn() or []:
+            path = f.get("path") or ""
+            rec = have.get(os.path.normcase(path))
+            if not rec:
+                out.append(f)
+                continue
+            if rec.get("mtime") != f.get("mtime"):
+                out.append(f)
+                continue
+            try:
+                age = now - datetime.strptime(rec.get("sized_at") or "", "%Y-%m-%dT%H:%M:%SZ") \
+                    .replace(tzinfo=timezone.utc).timestamp()
+            except (ValueError, TypeError):
+                out.append(f)
+                continue
+            if age > self.stale:
+                out.append(f)
+        return out
+
+    def _prune(self) -> None:
+        """Папок, которых уже нет в индексе, в файле не держим — иначе он растёт без предела. Делается на
+        каждом проходе, в том числе когда считать нечего: папку могли перенести в корзину или унести с тома."""
+        live = {os.path.normcase(x.get("path") or "") for x in (self.folders_fn() or [])}
+        with self.lock:
+            left = {k: v for k, v in self.sizes.items() if k in live}
+            if len(left) != len(self.sizes):
+                self.sizes = left
+                self._save()
+
+    def run_once(self) -> dict | None:
+        """Посчитать одну папку. None — считать нечего."""
+        self._prune()
+        todo = self.stale_folders()
+        if not todo:
+            return None
+        f = todo[0]
+        path = f.get("path") or ""
+        if not os.path.isdir(path):           # папку унесли между сканом и счётом
+            self.forget(path)
+            return None
+        with self.lock:
+            self.busy = path
+        try:
+            res = dir_size(path, max_sec=self.max_sec)
+        finally:
+            with self.lock:
+                self.busy = None
+        rec = {"path": path, "mtime": f.get("mtime"), "sized_at": _iso(time.time()), **res}
+        with self.lock:
+            self.sizes[os.path.normcase(path)] = rec
+            self._save()
+        log.info("размер %s: %s файлов, %s байт%s", path, res["files_total"], res["bytes_total"],
+                 " (не до конца: предел времени)" if res["partial"] else "")
+        return rec
+
+    def loop(self, first_delay: float = 90.0) -> None:
+        time.sleep(first_delay)                  # дать индексу собраться
+        while True:
+            try:
+                done = self.run_once()
+            except Exception:                    # счёт размеров не должен валить агента
+                log.exception("размер папки не посчитан")
+                done = None
+            time.sleep(self.between if done else self.idle)
 
 
 # ── выгрузка ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -701,3 +888,279 @@ class Copier:
         except Exception as e:
             log.exception("выгрузка %s → %s упала", src, dst)
             self._set(cid, state="failed", error=str(e)[:300], finished_at=_iso(time.time()))
+
+
+# ── корзина (1.5, ТЗ §3.2–3.4) ──────────────────────────────────────────────────────────────────────────────
+# «Авто в корзину, кнопкой сразу» (Виктор 25.11 ~14:25). Корзина — переименование внутри того же тома: данные
+# не копируются (терабайты), вернуть можно одной кнопкой, и перенос не занимает место на другом диске.
+# Удаление насовсем (`purge`) делает бэк — по кнопке человека или по сроку хранения из настройки.
+
+TRASH_NAME = "_КОРЗИНА"
+LOCK_PROBE_FILES = 20           # сколько файлов папки проверяем на «кто-то держит открытым»
+
+
+def _exclusive_busy(path: str, limit: int = LOCK_PROBE_FILES) -> str | None:
+    """Имя файла, который кто-то держит открытым (PC-3000 с задачей, снятие, наша выгрузка), либо None.
+    Открываем без разделения доступа и сразу закрываем — ничего не читаем и не меняем. Не Windows — None:
+    там переименование занятой папки и так не пройдёт."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    GENERIC_READ, NO_SHARE, OPEN_EXISTING = 0x80000000, 0, 3
+    invalid = wintypes.HANDLE(-1).value
+    checked = 0
+    for e in _scandir(path):
+        if checked >= limit:
+            break
+        try:
+            if not e.is_file(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        checked += 1
+        h = k32.CreateFileW(long_path(e.path), GENERIC_READ, NO_SHARE, None, OPEN_EXISTING, 0, None)
+        if h in (None, invalid):
+            err = ctypes.get_last_error()
+            if err in (32, 33):              # ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION
+                return e.name
+            continue                          # нет прав, файл исчез — это не «держат»
+        k32.CloseHandle(h)
+    return None
+
+
+def rmtree_safe(path: str) -> None:
+    """Удалить дерево, НЕ заходя за точки повторной обработки: junction и симлинк удаляем как ссылку
+    (`os.rmdir`), а не вместе с тем, на что они указывают. `shutil.rmtree` такой гарантии не даёт."""
+    if is_reparse(path):
+        os.rmdir(long_path(path))
+        return
+    for e in _scandir(path):
+        try:
+            is_dir = e.is_dir(follow_symlinks=False)
+        except OSError:
+            is_dir = False
+        if is_dir:
+            rmtree_safe(e.path)
+        else:
+            os.remove(long_path(e.path))
+    os.rmdir(long_path(path))
+
+
+class Trash:
+    """Корзина станции: `<том>:\\_КОРЗИНА\\<дата>_<имя>` + запись, откуда папку взяли.
+
+    Переносим только папку из индекса дисков и только внутри того же тома. Что не трогаем никогда:
+    корень тома, системный том, точки повторной обработки, саму корзину, папку, в которую сейчас пишут,
+    папку задания станции в работе и папку, чьи файлы кто-то держит открытыми (PC-3000, снятие).
+    Каждое действие — в журнал агента: кто, что, откуда, сколько байт."""
+
+    def __init__(self, state_path: Path | str, *, allowed_fn, index_fn=None, busy_fn=None, sizes_fn=None,
+                 fresh_sec: float = 600, forget_fn=None):
+        self.state_path = Path(state_path)
+        self.allowed_fn = allowed_fn or (lambda: set())
+        self.index_fn = index_fn or (lambda: [])
+        self.busy_fn = busy_fn or (lambda: set())
+        self.sizes_fn = sizes_fn or (lambda _p: None)
+        self.forget_fn = forget_fn                      # сказать Sizer, что размер больше не про эту папку
+        self.fresh_sec = fresh_sec
+        self.lock = threading.Lock()
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.items: list[dict] = [x for x in (data.get("items") or []) if isinstance(x, dict)]
+        except (OSError, ValueError):
+            self.items = []
+
+    # ── состояние ──
+
+    def _save(self) -> None:
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"items": self.items[-500:]}, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, self.state_path)
+
+    def list(self, state: str = "") -> list[dict]:
+        with self.lock:
+            out = [dict(i) for i in self.items]
+        if state:
+            out = [i for i in out if i.get("state") == state]
+        for i in out:
+            i["exists"] = os.path.isdir(i.get("dst") or "")
+        return out
+
+    def get(self, tid: str) -> dict | None:
+        with self.lock:
+            rec = next((dict(i) for i in self.items if i["id"] == tid), None)
+        if rec:
+            rec["exists"] = os.path.isdir(rec.get("dst") or "")
+        return rec
+
+    def _set(self, tid: str, **kw) -> None:
+        with self.lock:
+            for i in self.items:
+                if i["id"] == tid:
+                    i.update(kw)
+            self._save()
+
+    # ── проверки ──
+
+    def _index_rec(self, src: str) -> dict | None:
+        key = os.path.normcase(src)
+        return next((f for f in self.index_fn() or [] if os.path.normcase(f.get("path") or "") == key), None)
+
+    def check(self, path: str) -> tuple[str | None, str | None]:
+        """→ (путь, причина отказа). Один список запретов для корзины и для удаления насовсем."""
+        raw = (path or "").strip()
+        if not raw:
+            return None, "не указана папка"
+        src = os.path.normpath(raw)
+        if not os.path.isdir(src):
+            return None, f"папки нет на диске: {src}"
+        if is_reparse(src):
+            return None, "это ссылка (junction / симлинк), а не папка с данными — не трогаем"
+        drive, rest = os.path.splitdrive(src)
+        if not drive:
+            return None, "у папки нет буквы тома: в корзину переносим только внутри того же тома"
+        if not rest.strip("\\/"):
+            return None, "это корень тома, а не папка заказа"
+        sysdrive = (os.environ.get("SystemDrive") or "C:")[:2].upper()
+        if drive.upper() == sysdrive:
+            return None, f"папка на системном томе {sysdrive} — такие не удаляем"
+        if TRASH_NAME.lower() in [p.lower() for p in rest.split(os.sep)]:
+            return None, "папка уже в корзине"
+        if os.path.normcase(src) not in self.allowed_fn():
+            return None, "папки нет в индексе дисков станции — удаляем только то, что индекс нашёл сам"
+        busy = {os.path.normcase(b) for b in self.busy_fn() or set()}
+        key = os.path.normcase(src)
+        for b in busy:
+            if key == b or key.startswith(b.rstrip("\\") + "\\"):
+                return None, "по этой папке идёт работа станции (задание в работе или выгрузка) — сначала закончить"
+        rec = self._index_rec(src)
+        newest = (rec or {}).get("newest_file_at") or (rec or {}).get("mtime")
+        if self.fresh_sec and newest:
+            try:
+                age = time.time() - datetime.strptime(newest, "%Y-%m-%dT%H:%M:%SZ") \
+                    .replace(tzinfo=timezone.utc).timestamp()
+            except (ValueError, TypeError):
+                age = None
+            if age is not None and age < self.fresh_sec:
+                return None, (f"в папке менялись файлы {int(age // 60)} мин назад — в неё, похоже, ещё пишут; "
+                              "повторить, когда закончится")
+        held = _exclusive_busy(src)
+        if held:
+            return None, f"файл «{held}» кто-то держит открытым (задача в PC-3000, снятие) — папку не трогаем"
+        return src, None
+
+    # ── действия ──
+
+    def _unique(self, root: str, name: str) -> str:
+        stamp = time.strftime("%Y-%m-%d")
+        base = f"{stamp}_{name}"
+        cand = os.path.join(root, base)
+        n = 2
+        while os.path.exists(cand):
+            cand = os.path.join(root, f"{base}_{n}")
+            n += 1
+        return cand
+
+    def move(self, path: str, *, order_ref: str = "", by: str = "") -> tuple[dict | None, str | None]:
+        """Папку — в корзину того же тома. → (запись, ошибка)."""
+        src, err = self.check(path)
+        if err:
+            return None, err
+        drive = os.path.splitdrive(src)[0]
+        root = os.path.join(drive + os.sep, TRASH_NAME)
+        size = self.sizes_fn(src) or {}
+        try:
+            os.makedirs(long_path(root), exist_ok=True)
+            dst = self._unique(root, os.path.basename(src))
+            os.rename(long_path(src), long_path(dst))
+        except OSError as e:
+            # ERROR_SHARING_VIOLATION/ACCESS_DENIED: внутри открыт файл — выше проверили первые, но не все
+            return None, f"не перенести в корзину: {e}"[:300]
+        rec = {"id": uuid.uuid4().hex[:12], "src": src, "dst": dst, "name": os.path.basename(src),
+               "volume": drive.rstrip(":").upper(), "order_ref": (order_ref or "")[:40], "by": (by or "")[:200],
+               "at": _iso(time.time()), "state": "trashed",
+               "bytes_total": size.get("bytes_total"), "files_total": size.get("files_total")}
+        with self.lock:
+            self.items.append(rec)
+            self._save()
+        if self.forget_fn:
+            self.forget_fn(src)
+        log.info("КОРЗИНА: %s → %s (заказ %s, %s байт, по просьбе %s)", src, dst, rec["order_ref"] or "?",
+                 rec["bytes_total"] if rec["bytes_total"] is not None else "размер не считали", rec["by"] or "?")
+        return dict(rec), None
+
+    def restore(self, tid: str) -> tuple[dict | None, str | None]:
+        """Вернуть папку из корзины туда, откуда взяли."""
+        rec = self.get(tid)
+        if not rec:
+            return None, "нет такой записи корзины"
+        if rec["state"] != "trashed":
+            return None, f"эта папка уже {'удалена насовсем' if rec['state'] == 'purged' else 'возвращена'}"
+        if not os.path.isdir(rec["dst"]):
+            self._set(tid, state="gone", error="папки нет в корзине: убрали мимо агента")
+            return None, "папки нет в корзине — её убрали мимо агента"
+        if os.path.exists(rec["src"]):
+            return None, f"на прежнем месте уже что-то лежит: {rec['src']}"
+        try:
+            os.makedirs(long_path(os.path.dirname(rec["src"])), exist_ok=True)
+            os.rename(long_path(rec["dst"]), long_path(rec["src"]))
+        except OSError as e:
+            return None, f"не вернуть из корзины: {e}"[:300]
+        self._set(tid, state="restored", restored_at=_iso(time.time()))
+        log.info("КОРЗИНА: возврат %s → %s", rec["dst"], rec["src"])
+        return self.get(tid), None
+
+    def purge(self, tid: str, *, by: str = "") -> tuple[dict | None, str | None]:
+        """Удалить из корзины насовсем. Вернуть будет нечем."""
+        rec = self.get(tid)
+        if not rec:
+            return None, "нет такой записи корзины"
+        if rec["state"] == "purged":
+            return dict(rec), None                      # повтор запроса — не вторая попытка
+        if rec["state"] != "trashed":
+            return None, "эту папку уже вернули из корзины"
+        if not os.path.isdir(rec["dst"]):
+            self._set(tid, state="purged", purged_at=_iso(time.time()), purged_by=(by or "")[:200],
+                      error="папки в корзине уже не было")
+            return self.get(tid), None
+        held = _exclusive_busy(rec["dst"])
+        if held:
+            return None, f"файл «{held}» кто-то держит открытым — удалять не стали"
+        try:
+            rmtree_safe(rec["dst"])
+        except OSError as e:
+            return None, f"не удалить: {e}"[:300]
+        self._set(tid, state="purged", purged_at=_iso(time.time()), purged_by=(by or "")[:200])
+        log.info("КОРЗИНА: удалено насовсем %s (заказ %s, %s байт, %s)", rec["dst"], rec.get("order_ref") or "?",
+                 rec.get("bytes_total"), by or "?")
+        return self.get(tid), None
+
+    def delete_now(self, path: str, *, order_ref: str = "", by: str = "") -> tuple[dict | None, str | None]:
+        """«Удалить сразу» — без корзины. Запреты те же; доступность решает бэк (заказ закрыт в RO)."""
+        src, err = self.check(path)
+        if err:
+            return None, err
+        size = self.sizes_fn(src) or {}
+        try:
+            rmtree_safe(src)
+        except OSError as e:
+            return None, f"не удалить: {e}"[:300]
+        rec = {"id": uuid.uuid4().hex[:12], "src": src, "dst": None, "name": os.path.basename(src),
+               "volume": os.path.splitdrive(src)[0].rstrip(":").upper(), "order_ref": (order_ref or "")[:40],
+               "by": (by or "")[:200], "at": _iso(time.time()), "state": "purged",
+               "purged_at": _iso(time.time()), "purged_by": (by or "")[:200],
+               "bytes_total": size.get("bytes_total"), "files_total": size.get("files_total")}
+        with self.lock:
+            self.items.append(rec)
+            self._save()
+        if self.forget_fn:
+            self.forget_fn(src)
+        log.info("УДАЛЕНО СРАЗУ: %s (заказ %s, %s байт, по просьбе %s)", src, rec["order_ref"] or "?",
+                 rec["bytes_total"] if rec["bytes_total"] is not None else "размер не считали", rec["by"] or "?")
+        return dict(rec), None

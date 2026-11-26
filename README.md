@@ -110,9 +110,22 @@ openssl x509 -in station.crt -noout -fingerprint -sha256
 | `/screenshots` | `since=<unix-время>` | `{enabled, interval_sec, latest: {ok, age_sec | error}, last_error, items: [{name, at, size}]}` — лента, свежие первыми |
 | `/disks` | `refresh=1` — пересобрать | индекс дисков (1.4): `{scanned_at, scanning, volumes, folders: [{path, name, volume, depth, order_nums, is_data, info: {model, fw, serial, port, destin, text}, images: [{kind, files, bytes, where}], subdirs}], errors}` |
 | `/delivery/copies[/<id>]` | — | выгрузки на шару: `{state: queued…copying…verifying…done|failed|interrupted, files_total, bytes_total, files_done, bytes_done, skipped, verify: {src_files, src_bytes, dst_files, dst_bytes, ok, mismatch}}` |
+| `/folders/trash` | `state=trashed` | корзина станции (1.5): `{enabled, trash_name, items: [{id, src, dst, name, volume, order_ref, by, at, state: trashed\|restored\|purged\|gone, bytes_total, files_total, exists}]}` |
 
-Запись: `POST /jobs…` (задания, см. ниже) и `POST /delivery/copy {src}` — копия папки из индекса в
-`delivery_root\<имя папки>` (1.4).
+С 1.5 у папок в `/disks` есть размер: `bytes_total`, `files_total`, `sized_at` (**не посчитано — `null`, а не
+ноль**) и `sizes: {enabled, busy, known, todo}` — какую папку считают прямо сейчас.
+
+Запись: `POST /jobs…` (задания, см. ниже), `POST /delivery/copy {src}` — копия папки из индекса в
+`delivery_root\<имя папки>` (1.4), и корзина (1.5): `POST /folders/trash {path, order_ref, from}`,
+`POST /folders/delete {path, order_ref, from}` (без корзины), `POST /folders/restore {id}`,
+`POST /folders/purge {id}`. Отказ по запрету — 409 с текстом причины, его показывают человеку как есть.
+
+**Запуск команд (1.6)** — только при `exec = on` в `agent.ini`, иначе 404: `POST /exec {cmd, shell?: cmd|powershell,
+cwd?, timeout?}` → `{ok, exit_code, stdout, stderr, ms, timed_out, truncated}`. Таймаут по умолчанию 120 с, не больше
+3600; по истечении дерево процессов убивается. Вывод — до 2 МБ на поток. Каждая команда — строкой в журнал агента.
+Агент работает от системы (задача «вне входа»), поэтому команда видит все диски, но не экран пользователя. Нужна
+станции, на которой Claude не встаёт (LAB-2 на Windows 8.1): думает Claude на сервере, станция исполняет
+(Виктор 26.11: «Любая команда»). На остальных станциях строки нет — ручки нет.
 
 ## Индекс дисков и выдача данных (с версии 1.4, 19.11.2026)
 
@@ -143,7 +156,34 @@ delivery_user =                  ; учётка шары: агент — зад�
 delivery_password =              ; только локально, в agent.ini; агент делает net use сам
 delivery_fresh_min = 10          ; в папке менялись файлы позже — не копировать: выгрузку ещё пишут
 state_dir =                      ; где лежат datapool_index.json и delivery_copies.json (пусто — рядом с agent.py)
+sizes = on                       ; off — не считать размеры папок (1.5)
+size_pause_sec = 2               ; пауза между папками: на томах идёт снятие, счёт идёт по одной папке за раз
+size_max_min = 30                ; предел на одну папку; упёрлись — размер отдаётся с size_partial, 0 — без предела
 ```
+
+## Размеры папок и корзина (с версии 1.5, 25.11.2026)
+
+Задача 4131, ТЗ `TZ_lab_estimate_and_disks_2026-11-25.md` §3. Размер каждой папки индекса считает отдельный
+поток: по ОДНОЙ папке за проход, с паузами внутри обхода, только листинг каталогов (файлы не открываются),
+точки повторной обработки (junction, симлинк) не обходятся. Пересчёт — когда у папки изменилось время или раз
+в сутки. Состояние — `datapool_sizes.json`.
+
+Корзина — `<том>:\_КОРЗИНА\<дата>_<имя>`: папка **переименовывается внутри того же тома**, поэтому терабайты не
+копируются, а возврат мгновенный. Откуда взяли — в `folder_trash.json`; удаление насовсем и срок хранения
+решает бэк (`app_settings.lab_trash_keep_days`, 7 дней).
+
+Агент удалит папку, только если все условия выполнены. Иначе — 409 с причиной:
+
+- папка есть в индексе дисков (то, что нашёл сам агент), не корень тома и не на системном томе;
+- это не ссылка (junction / симлинк) и не сама корзина;
+- в папке не менялись файлы последние `delivery_fresh_min` минут (в неё, похоже, ещё пишут);
+- по папке не идёт работа станции: задание в состоянии `queued` / `running` / `waiting_*` / `cancel_requested`
+  (пути из `job.json` и папки индекса с номером заказа этого задания) и не идёт выгрузка на шару;
+- ни один файл папки не держат открытым (задача в PC-3000, снятие) — проверяется попыткой открыть без общего
+  доступа, ничего не читая.
+
+Права, подтверждение номером заказа и правило «удалить сразу можно только по закрытому заказу» — на бэке
+(`dashboard/lab_disks.py`): агент выполняет то, что бэк разрешил, но свои запреты держит сам.
 
 ## Снимки экрана (с версии 1.3, 18.11.2026)
 
